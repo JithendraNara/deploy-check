@@ -1,0 +1,20 @@
+{
+  "name": "deploy-check-v2",
+  "version": "2.0.0",
+  "description": "Repo Autopsy - Cloudflare deployability checker with cinematic UX",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "keywords": ["cloudflare", "deploy", "github", "analysis"],
+  "author": "Jithendra Nara",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/workers-types": "^4.20260426.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.86.0"
+  }
+}
