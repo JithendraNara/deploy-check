@@ -31,6 +31,12 @@ export default {
     if (path === '/api/share' && request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
+    if (path === '/api/autofix' && request.method === 'POST') {
+      return handleAutoFix(request, env);
+    }
+    if (path === '/api/autofix' && request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
 
     return new Response(HTML, {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
@@ -54,7 +60,7 @@ interface DeepAnalysis {
   migrationSignals?: { detected: boolean; platforms: string[]; notes: string[] };
   dependencies?: { total: number; devDeps: number; cloudflareRelated: string[]; serverFrameworks: string[]; buildTools: string[]; notes: string[] };
   workersCompatibility?: { score: number; issues: string[]; warnings: string[] };
-  frameworkDetection?: { framework: string; frameworkVersion?: string; adapter?: string; configFile?: string; renderMode?: 'ssr' | 'spa' | 'static' | 'isr' | 'unknown'; notes: string[] };
+  frameworkDetection?: { framework: string; frameworkVersion?: string; language?: string; adapter?: string; configFile?: string; renderMode?: 'ssr' | 'spa' | 'static' | 'isr' | 'unknown'; notes: string[] };
 }
 
 interface MigrationGuide {
@@ -345,6 +351,277 @@ async function handleAnalyze(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Framework Detectors
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface DetectedFramework {
+  framework: string;
+  frameworkVersion?: string;
+  language: string;
+  configFile?: string;
+  renderMode?: 'ssr' | 'spa' | 'static' | 'isr' | 'unknown';
+  adapter?: string;
+  notes: string[];
+}
+
+async function detectJSFramework(owner: string, repo: string, names: string[], pkg: any, env: Env): Promise<DetectedFramework | null> {
+  const allDeps = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) };
+  const framework: DetectedFramework = { framework: 'Node.js', language: 'javascript', notes: [] };
+
+  if (allDeps['next']) {
+    framework.framework = 'Next.js';
+    framework.frameworkVersion = allDeps['next'];
+    framework.configFile = names.find(n => n.startsWith('next.config')) || undefined;
+    framework.renderMode = allDeps['react-dom'] && !allDeps['next']?.includes('static') ? 'ssr' : 'static';
+    if (allDeps['@cloudflare/next-on-pages']) { framework.adapter = '@cloudflare/next-on-pages'; framework.notes.push('Cloudflare adapter already installed'); }
+    else if (allDeps['vercel']) framework.notes.push('Vercel-optimized Next.js');
+  } else if (allDeps['astro']) {
+    framework.framework = 'Astro';
+    framework.frameworkVersion = allDeps['astro'];
+    framework.configFile = names.find(n => n.startsWith('astro.config')) || undefined;
+    framework.renderMode = allDeps['@astrojs/node'] ? 'ssr' : 'static';
+    if (allDeps['@astrojs/cloudflare']) { framework.adapter = '@astrojs/cloudflare'; framework.notes.push('Cloudflare adapter already installed'); }
+  } else if (allDeps['svelte'] || allDeps['@sveltejs/kit']) {
+    framework.framework = 'SvelteKit';
+    framework.frameworkVersion = allDeps['@sveltejs/kit'] || allDeps['svelte'];
+    framework.configFile = names.find(n => n.startsWith('svelte.config')) || undefined;
+    framework.renderMode = 'ssr';
+    if (allDeps['@sveltejs/adapter-cloudflare']) { framework.adapter = '@sveltejs/adapter-cloudflare'; framework.notes.push('Cloudflare adapter already installed'); }
+    else if (allDeps['@sveltejs/adapter-auto']) framework.notes.push('Using adapter-auto');
+    else if (allDeps['@sveltejs/adapter-vercel']) framework.notes.push('Currently using Vercel adapter');
+  } else if (allDeps['nuxt'] || allDeps['nuxt3']) {
+    framework.framework = 'Nuxt';
+    framework.frameworkVersion = allDeps['nuxt'] || allDeps['nuxt3'];
+    framework.configFile = names.find(n => n.startsWith('nuxt.config')) || undefined;
+    framework.renderMode = 'ssr';
+    if (allDeps['nitro-cloudflare-dev']) framework.notes.push('Nitro with Cloudflare preset');
+  } else if (allDeps['@remix-run/react'] || allDeps['remix']) {
+    framework.framework = 'Remix';
+    framework.frameworkVersion = allDeps['@remix-run/react'] || allDeps['remix'];
+    framework.configFile = names.find(n => n.startsWith('remix.config') || n.startsWith('vite.config')) || undefined;
+    framework.renderMode = 'ssr';
+    if (allDeps['@remix-run/cloudflare']) { framework.adapter = '@remix-run/cloudflare'; framework.notes.push('Cloudflare adapter already installed'); }
+  } else if (allDeps['@angular/core'] || allDeps['angular']) {
+    framework.framework = 'Angular';
+    framework.frameworkVersion = allDeps['@angular/core'] || allDeps['angular'];
+    framework.configFile = names.find(n => n.startsWith('angular.json')) || undefined;
+    framework.renderMode = 'spa';
+  } else if (allDeps['vue'] || allDeps['vite']) {
+    framework.framework = 'Vue/Vite';
+    framework.frameworkVersion = allDeps['vite'] || allDeps['vue'];
+    framework.configFile = names.find(n => n.startsWith('vite.config')) || undefined;
+    framework.renderMode = 'spa';
+  } else if (allDeps['react'] && !allDeps['next']) {
+    framework.framework = 'React';
+    framework.frameworkVersion = allDeps['react'];
+    framework.renderMode = 'spa';
+    framework.notes.push('Plain React app - may need build config');
+  } else if (allDeps['hono']) {
+    framework.framework = 'Hono';
+    framework.frameworkVersion = allDeps['hono'];
+    framework.renderMode = 'ssr';
+    framework.notes.push('Hono is Cloudflare-native');
+  } else {
+    return null;
+  }
+  return framework;
+}
+
+async function detectPythonFramework(owner: string, repo: string, names: string[], env: Env): Promise<DetectedFramework | null> {
+  const framework: DetectedFramework = { framework: 'Python', language: 'python', notes: [] };
+
+  // Check requirements.txt
+  let reqs = '';
+  if (names.includes('requirements.txt')) {
+    const content = await fetchFileContent(owner, repo, 'requirements.txt', env);
+    if (content) reqs = content.toLowerCase();
+  }
+  // Check pyproject.toml
+  let pyproject = '';
+  if (names.includes('pyproject.toml')) {
+    const content = await fetchFileContent(owner, repo, 'pyproject.toml', env);
+    if (content) pyproject = content.toLowerCase();
+  }
+  const combined = reqs + pyproject;
+
+  if (combined.includes('django')) {
+    framework.framework = 'Django';
+    framework.configFile = names.find(n => n === 'manage.py') || undefined;
+    framework.notes.push('Django app - needs Containers or ASGI Workers');
+  } else if (combined.includes('fastapi')) {
+    framework.framework = 'FastAPI';
+    framework.configFile = names.find(n => n === 'main.py' || n.endsWith('.py')) || undefined;
+    framework.notes.push('FastAPI - excellent for Cloudflare Containers');
+  } else if (combined.includes('flask')) {
+    framework.framework = 'Flask';
+    framework.configFile = names.find(n => n === 'app.py' || n === 'wsgi.py') || undefined;
+    framework.notes.push('Flask app - straightforward containerization');
+  } else if (combined.includes('tornado') || combined.includes('bottle') || combined.includes('quart')) {
+    const fw = combined.includes('tornado') ? 'Tornado' : combined.includes('bottle') ? 'Bottle' : 'Quart';
+    framework.framework = fw;
+    framework.notes.push(`${fw} - containerize with gunicorn/uvicorn`);
+  } else if (names.includes('app.py') || names.includes('main.py') || combined.length > 0) {
+    framework.framework = 'Python';
+    framework.notes.push('Generic Python app - containerization recommended');
+  } else {
+    return null;
+  }
+  return framework;
+}
+
+async function detectGoFramework(owner: string, repo: string, names: string[], env: Env): Promise<DetectedFramework | null> {
+  const framework: DetectedFramework = { framework: 'Go', language: 'go', notes: [] };
+
+  if (!names.includes('go.mod')) return null;
+
+  const goMod = await fetchFileContent(owner, repo, 'go.mod', env);
+  if (!goMod) return framework;
+
+  const content = goMod.toLowerCase();
+  if (content.includes('gin-gonic')) {
+    framework.framework = 'Gin';
+    framework.notes.push('Gin web framework - compile to static binary for Containers');
+  } else if (content.includes('echo') || content.includes('labstack')) {
+    framework.framework = 'Echo';
+    framework.notes.push('Echo framework - lightweight, great for containers');
+  } else if (content.includes('fiber')) {
+    framework.framework = 'Fiber';
+    framework.notes.push('Fiber (Express-inspired) - fast, container-friendly');
+  } else if (content.includes('chi')) {
+    framework.framework = 'Chi';
+    framework.notes.push('Chi router - minimal, container-ready');
+  } else if (content.includes('mux') || content.includes('gorilla')) {
+    framework.framework = 'Gorilla Mux';
+    framework.notes.push('Gorilla toolkit - standard Go HTTP');
+  } else {
+    framework.framework = 'Go';
+    framework.notes.push('Standard Go app - build static binary for Containers');
+  }
+  return framework;
+}
+
+async function detectRustFramework(owner: string, repo: string, names: string[], env: Env): Promise<DetectedFramework | null> {
+  const framework: DetectedFramework = { framework: 'Rust', language: 'rust', notes: [] };
+
+  if (!names.includes('Cargo.toml')) return null;
+
+  const cargo = await fetchFileContent(owner, repo, 'Cargo.toml', env);
+  if (!cargo) return framework;
+
+  const content = cargo.toLowerCase();
+  if (content.includes('actix-web')) {
+    framework.framework = 'Actix Web';
+    framework.notes.push('Actix Web - high-performance, container-friendly');
+  } else if (content.includes('axum')) {
+    framework.framework = 'Axum';
+    framework.notes.push('Axum (Tokio) - modern Rust web framework');
+  } else if (content.includes('rocket')) {
+    framework.framework = 'Rocket';
+    framework.notes.push('Rocket - compile in release mode for containers');
+  } else if (content.includes('tide') || content.includes('warp')) {
+    const fw = content.includes('tide') ? 'Tide' : 'Warp';
+    framework.framework = fw;
+    framework.notes.push(`${fw} - async Rust framework`);
+  } else if (content.includes('worker') || content.includes('wasm')) {
+    framework.framework = 'Rust (Workers/WASM)';
+    framework.notes.push('WASM-compatible Rust - could run on Workers!');
+    framework.adapter = 'wasm-bindgen';
+  } else {
+    framework.framework = 'Rust';
+    framework.notes.push('Rust app - compile to static binary for Containers');
+  }
+  return framework;
+}
+
+async function detectJavaFramework(owner: string, repo: string, names: string[], env: Env): Promise<DetectedFramework | null> {
+  const framework: DetectedFramework = { framework: 'Java', language: 'java', notes: [] };
+  const hasPom = names.includes('pom.xml');
+  const hasGradle = names.some(n => n.includes('build.gradle') || n === 'gradlew');
+
+  if (!hasPom && !hasGradle) return null;
+
+  framework.notes.push(hasPom ? 'Maven project' : 'Gradle project');
+
+  if (hasPom) {
+    const pom = await fetchFileContent(owner, repo, 'pom.xml', env);
+    if (pom) {
+      const content = pom.toLowerCase();
+      if (content.includes('spring-boot')) {
+        framework.framework = 'Spring Boot';
+        framework.notes.push('Spring Boot - containerize with Jib or Dockerfile');
+      } else if (content.includes('quarkus')) {
+        framework.framework = 'Quarkus';
+        framework.notes.push('Quarkus - native compilation possible for Containers');
+      } else if (content.includes('micronaut')) {
+        framework.framework = 'Micronaut';
+        framework.notes.push('Micronaut - AOT compilation, container-friendly');
+      }
+    }
+  } else if (hasGradle) {
+    const gradle = await fetchFileContent(owner, repo, 'build.gradle', env);
+    if (gradle) {
+      const content = gradle.toLowerCase();
+      if (content.includes('spring')) {
+        framework.framework = 'Spring Boot';
+        framework.notes.push('Spring Boot with Gradle');
+      }
+    }
+  }
+
+  return framework;
+}
+
+function computeWorkersCompatibility(allDeps: Record<string, string>): { score: number; issues: string[]; warnings: string[] } {
+  const issues: string[] = [];
+  const warnings: string[] = [];
+  const deps = Object.keys(allDeps);
+
+  const incompatible = [
+    'express', 'koa', 'fastify', 'restify', 'hapi', 'socket.io',
+    'node-cron', 'bull', 'agenda', 'node-schedule',
+    'sharp', 'bcrypt', 'argon2', 'sqlite3',
+    'prisma', '@prisma/client', 'sequelize', 'typeorm',
+    'mongoose', 'mongodb', 'pg', 'mysql2',
+    'puppeteer', 'playwright', 'selenium-webdriver',
+    'canvas', 'node-gd', 'jimp',
+    'ffmpeg-static', 'fluent-ffmpeg', 'node-speech',
+    'node-pty', 'ssh2', 'telnet-client',
+    'dgram', 'net', 'tls', 'child_process', 'cluster',
+  ];
+
+  const compatible = [
+    'hono', 'itty-router', '@cloudflare/workers-types', 'wrangler',
+    'jose', '@tsndr/cloudflare-worker-jwt',
+    'drizzle-orm', 'kysely',
+    '@neondatabase/serverless', 'postgres',
+  ];
+
+  deps.forEach(d => {
+    if (incompatible.includes(d)) issues.push(d);
+    if (compatible.includes(d)) warnings.push(`${d} is Cloudflare-friendly`);
+  });
+
+  // Framework-specific issues
+  if (deps.includes('next') && !deps.includes('@cloudflare/next-on-pages')) {
+    issues.push('next (needs @cloudflare/next-on-pages adapter)');
+  }
+  if (deps.includes('react') && !deps.includes('react-dom/server')) {
+    warnings.push('React without SSR - may need hydration setup');
+  }
+
+  let score = 100;
+  score -= issues.length * 12;
+  score -= warnings.filter(w => !w.includes('friendly')).length * 5;
+  score = Math.max(0, Math.min(100, score));
+
+  return { score, issues, warnings };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Analysis
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function analyzeRepo(owner: string, repoName: string, env: Env): Promise<AnalyzeResult> {
   const apiUrl = `https://api.github.com/repos/${owner}/${repoName}/contents/`;
   const res = await fetch(apiUrl, { headers: makeGhHeaders(env) });
@@ -374,18 +651,24 @@ async function analyzeRepo(owner: string, repoName: string, env: Env): Promise<A
       migrationSignals: { detected: false, platforms: [], notes: [] },
       dependencies: { total: 0, devDeps: 0, cloudflareRelated: [], serverFrameworks: [], buildTools: [], notes: [] },
       workersCompatibility: { score: 0, issues: [], warnings: [] },
+      frameworkDetection: { framework: 'Unknown', notes: [] },
     },
     ricComments: [], scanLog: [],
   };
 
+  // ── File existence checks ──
   const hasPackageJson = names.includes('package.json');
   const hasWrangler = names.includes('wrangler.json') || names.includes('wrangler.jsonc') || names.includes('wrangler.toml');
   const hasDockerfile = names.includes('Dockerfile');
-  const hasAppPy = names.includes('app.py');
   const hasRequirements = names.includes('requirements.txt');
   const hasGoMod = names.includes('go.mod');
   const hasCargo = names.includes('Cargo.toml');
+  const hasPom = names.includes('pom.xml');
+  const hasGradle = names.some(n => n.includes('build.gradle') || n === 'gradlew');
+  const hasPyproject = names.includes('pyproject.toml');
+  const hasPipfile = names.includes('Pipfile');
 
+  // ── Fetch package.json for JS projects ──
   let pkg: any = null;
   if (hasPackageJson) {
     try {
@@ -398,6 +681,36 @@ async function analyzeRepo(owner: string, repoName: string, env: Env): Promise<A
   const devDeps = pkg?.devDependencies || {};
   const allDeps = { ...deps, ...devDeps };
 
+  // ── Detect language & framework ──
+  let detectedFw: DetectedFramework | null = null;
+
+  if (hasPackageJson) {
+    detectedFw = await detectJSFramework(owner, repoName, names, pkg, env);
+  } else if (hasRequirements || hasPyproject || hasPipfile || names.some(n => n.endsWith('.py'))) {
+    detectedFw = await detectPythonFramework(owner, repoName, names, env);
+  } else if (hasGoMod) {
+    detectedFw = await detectGoFramework(owner, repoName, names, env);
+  } else if (hasCargo) {
+    detectedFw = await detectRustFramework(owner, repoName, names, env);
+  } else if (hasPom || hasGradle) {
+    detectedFw = await detectJavaFramework(owner, repoName, names, env);
+  }
+
+  if (detectedFw) {
+    result.detectedStack = detectedFw.framework;
+    result.deepAnalysis.frameworkDetection = {
+      framework: detectedFw.framework,
+      frameworkVersion: detectedFw.frameworkVersion,
+      language: detectedFw.language,
+      configFile: detectedFw.configFile,
+      renderMode: detectedFw.renderMode,
+      adapter: detectedFw.adapter,
+      notes: detectedFw.notes,
+    };
+    result.why.push(`Detected ${detectedFw.framework} (${detectedFw.language})`);
+  }
+
+  // ── Dockerfile analysis ──
   if (hasDockerfile) {
     const dockerContent = await fetchFileContent(owner, repoName, 'Dockerfile', env);
     if (dockerContent) {
@@ -407,52 +720,239 @@ async function analyzeRepo(owner: string, repoName: string, env: Env): Promise<A
       const fromMatch = dockerContent.match(/FROM\s+(\S+)/i);
       d.distro = fromMatch ? fromMatch[1] : 'unknown';
       d.exposesPort = /EXPOSE\s+\d+/i.test(dockerContent);
+      const nodeMatch = dockerContent.match(/node:?(\d+)/i);
+      d.nodeVersion = nodeMatch ? nodeMatch[1] : undefined;
       if (d.multiStage) d.notes.push('Multi-stage build detected');
       if (d.distro.includes('alpine')) d.notes.push('Alpine-based - minimal');
+      if (d.distro.includes('python')) d.notes.push('Python base image');
+      if (d.distro.includes('golang')) d.notes.push('Go base image');
+      if (d.distro.includes('rust')) d.notes.push('Rust base image');
     }
   }
 
+  // ── CI/CD detection ──
   const hasGithubActions = names.includes('.github');
   if (hasGithubActions) {
     const cicd = result.deepAnalysis.cicd!;
     cicd.detected = true;
     cicd.platforms.push('GitHub Actions');
+    // Check for workflow files
+    const workflows = await fetchDirContents(owner, repoName, '.github/workflows', env);
+    cicd.workflows = workflows.map(w => w.name);
+    // Check if any workflow references Cloudflare
+    for (const wf of workflows.slice(0, 3)) {
+      const content = await fetchFileContent(owner, repoName, `.github/workflows/${wf.name}`, env);
+      if (content) {
+        if (content.includes('cloudflare') || content.includes('wrangler') || content.includes('pages.dev')) {
+          cicd.hasCloudflareDeploy = true;
+          break;
+        }
+      }
+    }
   }
 
+  // Check for other CI configs
+  if (names.includes('vercel.json')) {
+    result.deepAnalysis.cicd!.detected = true;
+    result.deepAnalysis.cicd!.platforms.push('Vercel');
+    result.deepAnalysis.migrationSignals!.detected = true;
+    result.deepAnalysis.migrationSignals!.platforms.push('Vercel');
+  }
+  if (names.includes('netlify.toml')) {
+    result.deepAnalysis.cicd!.detected = true;
+    result.deepAnalysis.cicd!.platforms.push('Netlify');
+    result.deepAnalysis.migrationSignals!.detected = true;
+    result.deepAnalysis.migrationSignals!.platforms.push('Netlify');
+  }
+  if (names.includes('railway.json') || names.includes('railway.yaml')) {
+    result.deepAnalysis.migrationSignals!.detected = true;
+    result.deepAnalysis.migrationSignals!.platforms.push('Railway');
+  }
+  if (names.includes('fly.toml')) {
+    result.deepAnalysis.migrationSignals!.detected = true;
+    result.deepAnalysis.migrationSignals!.platforms.push('Fly.io');
+  }
+  if (names.includes('render.yaml')) {
+    result.deepAnalysis.migrationSignals!.detected = true;
+    result.deepAnalysis.migrationSignals!.platforms.push('Render');
+  }
+
+  // ── Dependency analysis (JS only for now) ──
   const depAnalysis = result.deepAnalysis.dependencies!;
-  depAnalysis.total = Object.keys(deps).length;
-  depAnalysis.devDeps = Object.keys(devDeps).length;
+  if (hasPackageJson) {
+    depAnalysis.total = Object.keys(deps).length;
+    depAnalysis.devDeps = Object.keys(devDeps).length;
 
-  const cloudflareDeps = ['wrangler', '@cloudflare/workers-types', 'hono', 'itty-router'];
-  cloudflareDeps.forEach((cd: string) => { if (allDeps[cd]) depAnalysis.cloudflareRelated.push(cd); });
+    const cloudflareDeps = ['wrangler', '@cloudflare/workers-types', 'hono', 'itty-router', '@cloudflare/pages-plugin-', 'next-on-pages'];
+    cloudflareDeps.forEach((cd: string) => {
+      Object.keys(allDeps).forEach(d => { if (d.includes(cd.replace(/-$/, ''))) depAnalysis.cloudflareRelated.push(d); });
+    });
 
-  if (hasWrangler) {
-    result.verdict = 'workers'; result.verdictLabel = 'Cloudflare Workers';
-    result.verdictColor = '#f97316'; result.verdictEmoji = '⚡';
-    result.score = 95; result.detectedStack = 'Cloudflare Worker';
-    result.why.push('wrangler config detected'); result.canAutodeploy = true;
-    result.recommendations.push('Run `wrangler deploy` to deploy instantly');
-  } else if (hasDockerfile) {
-    result.verdict = 'containers'; result.verdictLabel = 'Cloudflare Containers';
-    result.verdictColor = '#a855f7'; result.verdictEmoji = '📦';
-    result.score = 60; result.detectedStack = 'Docker / Containerized';
-    result.why.push('Dockerfile found');
-  } else if (hasAppPy || hasRequirements) {
-    result.verdict = 'not-compatible'; result.verdictLabel = 'Not Cloudflare-Native';
-    result.verdictColor = '#ef4444'; result.verdictEmoji = '💀';
-    result.score = 15; result.detectedStack = 'Python';
-    result.why.push('Python app - not Workers-compatible');
-  } else if (hasGoMod || hasCargo) {
-    result.verdict = 'not-compatible'; result.verdictLabel = 'Not Cloudflare-Native';
-    result.verdictColor = '#ef4444'; result.verdictEmoji = '💀';
-    result.score = 20; result.detectedStack = hasGoMod ? 'Go' : 'Rust';
-    result.why.push('Compiled language - needs WASM or Containers');
-  } else if (hasPackageJson) {
-    result.verdict = 'pages-spa'; result.verdictLabel = 'Cloudflare Pages (SPA)';
-    result.verdictColor = '#3b82f6'; result.verdictEmoji = '🚀';
-    result.score = 75; result.detectedStack = 'Node.js Project';
-    result.why.push('package.json detected'); result.canAutodeploy = true;
+    const serverFrameworks = ['express', 'fastify', 'koa', 'hapi', 'restify', 'nestjs', 'sails', 'feathers'];
+    serverFrameworks.forEach((sf: string) => { if (allDeps[sf]) depAnalysis.serverFrameworks.push(sf); });
+
+    const buildTools = ['vite', 'webpack', 'rollup', 'esbuild', 'parcel', 'turbo'];
+    buildTools.forEach((bt: string) => { if (allDeps[bt] || devDeps[bt]) depAnalysis.buildTools.push(bt); });
+
+    // Workers compatibility
+    result.deepAnalysis.workersCompatibility = computeWorkersCompatibility(allDeps);
   }
+
+  // ── Scoring & Verdict ──
+  let baseScore = 50;
+
+  // Already configured for Cloudflare?
+  if (hasWrangler) {
+    baseScore = 95;
+    result.verdict = 'workers';
+    result.verdictLabel = 'Cloudflare Workers';
+    result.verdictColor = '#f97316'; result.verdictEmoji = '⚡';
+    result.canAutodeploy = true;
+    result.why.push('wrangler config detected');
+    result.recommendations.push('Run `wrangler deploy` to deploy instantly');
+  }
+  // Has Dockerfile - Containers candidate
+  else if (hasDockerfile) {
+    baseScore = 70;
+    result.verdict = 'containers';
+    result.verdictLabel = 'Cloudflare Containers';
+    result.verdictColor = '#a855f7'; result.verdictEmoji = '📦';
+    result.why.push('Dockerfile found - ready for containerization');
+    result.recommendations.push('Build and push to Cloudflare Container Registry');
+    result.recommendations.push('Create a Container deployment with `wrangler`');
+    if (detectedFw) {
+      result.detectedStack = `${detectedFw.framework} (Containerized)`;
+    }
+  }
+  // JS framework detected
+  else if (detectedFw?.language === 'javascript') {
+    const fw = detectedFw.framework;
+    const hasAdapter = !!detectedFw.adapter;
+    const wc = result.deepAnalysis.workersCompatibility;
+
+    if (hasAdapter) {
+      baseScore = 90;
+      result.verdict = 'pages-static';
+      result.verdictLabel = 'Cloudflare Pages';
+      result.verdictColor = '#3b82f6'; result.verdictEmoji = '🚀';
+      result.canAutodeploy = true;
+      result.why.push(`${fw} with Cloudflare adapter installed`);
+      result.recommendations.push('Run `wrangler pages deploy` to deploy');
+    } else if (wc.score >= 80) {
+      baseScore = 80;
+      result.verdict = 'workers';
+      result.verdictLabel = 'Cloudflare Workers';
+      result.verdictColor = '#f97316'; result.verdictEmoji = '⚡';
+      result.canAutodeploy = true;
+      result.why.push(`${fw} is Workers-compatible (score: ${wc.score})`);
+      result.recommendations.push('Add Cloudflare adapter and deploy');
+    } else if (wc.score >= 50) {
+      baseScore = 65;
+      result.verdict = 'pages-spa';
+      result.verdictLabel = 'Cloudflare Pages (SPA)';
+      result.verdictColor = '#3b82f6'; result.verdictEmoji = '🚀';
+      result.canAutodeploy = true;
+      result.why.push(`${fw} can run on Pages with some adjustments`);
+      result.recommendations.push('Install Cloudflare adapter for your framework');
+    } else {
+      baseScore = 40;
+      result.verdict = 'containers';
+      result.verdictLabel = 'Cloudflare Containers';
+      result.verdictColor = '#a855f7'; result.verdictEmoji = '📦';
+      result.why.push(`${fw} has Workers compatibility issues`);
+      result.recommendations.push('Containerize this app for Cloudflare Containers');
+      result.recommendations.push('Or migrate to a Cloudflare-native framework like Hono');
+    }
+  }
+  // Python detected
+  else if (detectedFw?.language === 'python') {
+    baseScore = hasDockerfile ? 75 : 50;
+    result.verdict = 'containers';
+    result.verdictLabel = 'Cloudflare Containers';
+    result.verdictColor = '#a855f7'; result.verdictEmoji = '📦';
+    result.why.push(`${detectedFw.framework} app - best on Containers`);
+    if (!hasDockerfile) {
+      result.recommendations.push('Add a Dockerfile for containerization');
+      result.recommendations.push('Use gunicorn/uvicorn as the entrypoint');
+    } else {
+      result.recommendations.push('Build container and deploy to Cloudflare');
+    }
+  }
+  // Go detected
+  else if (detectedFw?.language === 'go') {
+    baseScore = hasDockerfile ? 80 : 55;
+    result.verdict = 'containers';
+    result.verdictLabel = 'Cloudflare Containers';
+    result.verdictColor = '#a855f7'; result.verdictEmoji = '📦';
+    result.why.push(`${detectedFw.framework} app - compile to static binary`);
+    if (!hasDockerfile) {
+      result.recommendations.push('Add a multi-stage Dockerfile (build with golang:latest, run with scratch/alpine)');
+    }
+    result.recommendations.push('Use `CGO_ENABLED=0` for static binary');
+  }
+  // Rust detected
+  else if (detectedFw?.language === 'rust') {
+    baseScore = hasDockerfile ? 80 : 55;
+    if (detectedFw.adapter === 'wasm-bindgen') {
+      result.verdict = 'workers';
+      result.verdictLabel = 'Cloudflare Workers (WASM)';
+      result.verdictColor = '#f97316'; result.verdictEmoji = '⚡';
+      baseScore = 85;
+      result.why.push('WASM-compatible Rust - can run on Workers');
+      result.recommendations.push('Use `wasm-pack` to build for Workers');
+    } else {
+      result.verdict = 'containers';
+      result.verdictLabel = 'Cloudflare Containers';
+      result.verdictColor = '#a855f7'; result.verdictEmoji = '📦';
+      result.why.push(`${detectedFw.framework} app - compile in release mode`);
+      if (!hasDockerfile) {
+        result.recommendations.push('Add a multi-stage Dockerfile with rust:slim');
+      }
+    }
+  }
+  // Java detected
+  else if (detectedFw?.language === 'java') {
+    baseScore = hasDockerfile ? 70 : 45;
+    result.verdict = 'containers';
+    result.verdictLabel = 'Cloudflare Containers';
+    result.verdictColor = '#a855f7'; result.verdictEmoji = '📦';
+    result.why.push(`${detectedFw.framework} app - JRE-based containerization`);
+    if (!hasDockerfile) {
+      result.recommendations.push('Add Dockerfile with Eclipse Temurin or Amazon Corretto base');
+    }
+  }
+  // Fallback: has package.json but no framework detected
+  else if (hasPackageJson) {
+    baseScore = 60;
+    result.verdict = 'pages-spa';
+    result.verdictLabel = 'Cloudflare Pages (SPA)';
+    result.verdictColor = '#3b82f6'; result.verdictEmoji = '🚀';
+    result.detectedStack = 'Node.js';
+    result.why.push('package.json detected');
+    result.canAutodeploy = true;
+    result.recommendations.push('Configure build command in Pages settings');
+  }
+  // Truly unknown
+  else {
+    baseScore = 20;
+    result.verdict = 'uncertain';
+    result.verdictLabel = 'Uncertain';
+    result.verdictColor = '#888'; result.verdictEmoji = '?';
+    result.why.push('Could not determine stack');
+    result.recommendations.push('Add a README with stack details');
+  }
+
+  // Adjust score based on Dockerfile quality
+  if (hasDockerfile && result.deepAnalysis.dockerfile?.multiStage) {
+    baseScore += 5;
+  }
+
+  // Adjust score based on CI/CD presence
+  if (result.deepAnalysis.cicd?.detected) {
+    baseScore += 5;
+  }
+
+  result.score = Math.min(100, Math.max(0, baseScore));
 
   result.migrationGuide = buildMigrationGuide(result.deepAnalysis, result.detectedStack, pkg);
   result.ricComments = generateRicComments(result);
@@ -463,11 +963,130 @@ async function analyzeRepo(owner: string, repoName: string, env: Env): Promise<A
 
 function buildMigrationGuide(deep: DeepAnalysis, stack: string, pkg: any): MigrationGuide | undefined {
   if (stack === 'Cloudflare Worker') return undefined;
+
+  const today = new Date().toISOString().split('T')[0];
+  const fd = deep.frameworkDetection;
+  const fw = fd?.framework || stack;
+  const language = fd?.language || 'javascript';
+
+  // Python guides
+  if (language === 'python') {
+    const pyFw = fw.toLowerCase();
+    const steps = ['Create a Dockerfile with your Python framework', 'Use a slim base image (python:3.11-slim)', 'Install dependencies from requirements.txt', 'Set up gunicorn/uvicorn as the entrypoint', 'Build and deploy to Cloudflare Containers'];
+    const gotchas = ['Ensure all deps are in requirements.txt', 'Use environment variables for config', 'Health check endpoint recommended'];
+    if (pyFw.includes('django')) {
+      steps.splice(2, 0, 'Run collectstatic before serving');
+      gotchas.push('Django needs STATIC_ROOT and MEDIA_ROOT configured');
+    }
+    return {
+      framework: fw, targetProduct: 'Cloudflare Containers', productUrl: 'https://developers.cloudflare.com/containers',
+      effort: 'medium', estimatedTime: '30 min',
+      steps, configChanges: ['Add Dockerfile', 'Create requirements.txt if missing'], gotchas,
+      docsUrl: 'https://developers.cloudflare.com/containers',
+    };
+  }
+
+  // Go guides
+  if (language === 'go') {
+    return {
+      framework: fw, targetProduct: 'Cloudflare Containers', productUrl: 'https://developers.cloudflare.com/containers',
+      effort: 'easy', estimatedTime: '20 min',
+      steps: ['Create multi-stage Dockerfile', 'Build stage: golang:latest with CGO_ENABLED=0', 'Runtime stage: scratch or alpine', 'Copy static binary to runtime stage', 'Expose port and set CMD', 'Build and deploy to Cloudflare Containers'],
+      configChanges: ['Add Dockerfile', 'Ensure go.mod is tidy'], gotchas: ['CGO_ENABLED=0 is required for scratch images', 'Use distroless or alpine for smaller images'],
+      docsUrl: 'https://developers.cloudflare.com/containers',
+    };
+  }
+
+  // Rust guides
+  if (language === 'rust') {
+    if (fd?.adapter === 'wasm-bindgen') {
+      return {
+        framework: fw, targetProduct: 'Cloudflare Workers (WASM)', productUrl: 'https://developers.cloudflare.com/workers',
+        effort: 'hard', estimatedTime: '2 hours',
+        steps: ['Install wasm-pack', 'Configure wasm-bindgen for Workers', 'Build with wasm-pack build --target web', 'Set up wrangler.toml with wasm_module', 'Deploy with wrangler deploy'],
+        configChanges: ['Add wrangler.toml with wasm_module path', 'Configure Cargo.toml for wasm32 target'], gotchas: ['Not all Rust crates compile to WASM', 'Avoid std::fs and std::net in WASM'],
+        docsUrl: 'https://developers.cloudflare.com/workers/languages/rust',
+      };
+    }
+    return {
+      framework: fw, targetProduct: 'Cloudflare Containers', productUrl: 'https://developers.cloudflare.com/containers',
+      effort: 'medium', estimatedTime: '30 min',
+      steps: ['Create multi-stage Dockerfile with rust:slim', 'Build in release mode: cargo build --release', 'Runtime stage: debian:stable-slim or alpine', 'Copy binary from target/release/', 'Expose port and deploy'],
+      configChanges: ['Add Dockerfile', 'Ensure Cargo.lock is committed'], gotchas: ['Alpine needs musl target (x86_64-unknown-linux-musl)', 'Release builds take longer but run faster'],
+      docsUrl: 'https://developers.cloudflare.com/containers',
+    };
+  }
+
+  // Java guides
+  if (language === 'java') {
+    return {
+      framework: fw, targetProduct: 'Cloudflare Containers', productUrl: 'https://developers.cloudflare.com/containers',
+      effort: 'medium', estimatedTime: '45 min',
+      steps: ['Create Dockerfile with Eclipse Temurin or Amazon Corretto JRE', 'Copy JAR or WAR file to container', 'Set JAVA_OPTS for containerized environment', 'Expose application port', 'Build and deploy to Cloudflare Containers'],
+      configChanges: ['Add Dockerfile', 'Configure Maven/Gradle to build fat JAR'], gotchas: ['Use JRE not JDK for smaller images', 'Consider GraalVM native image for smaller footprint'],
+      docsUrl: 'https://developers.cloudflare.com/containers',
+    };
+  }
+
+  // JS framework guides
+  const fwLower = fw.toLowerCase();
+  if (fwLower.includes('next.js')) {
+    return {
+      framework: 'Next.js', targetProduct: 'Cloudflare Pages', productUrl: 'https://pages.dev',
+      effort: 'easy', adapter: '@cloudflare/next-on-pages', adapterInstall: 'npm install @cloudflare/next-on-pages',
+      estimatedTime: '20 min',
+      steps: ['Install @cloudflare/next-on-pages', 'Update next.config.js with output: "export"', 'Add wrangler.toml', 'Run npx @cloudflare/next-on-pages@latest', 'Deploy with wrangler pages deploy'],
+      configChanges: [`name = "my-next-app"\ncompatibility_date = "${today}"\npages_build_output_dir = ".vercel/output/static"`],
+      gotchas: ['API routes need @cloudflare/next-on-pages', 'Some Node.js APIs are not available'], docsUrl: 'https://developers.cloudflare.com/pages/framework-guides/nextjs/',
+    };
+  }
+  if (fwLower.includes('astro')) {
+    return {
+      framework: 'Astro', targetProduct: 'Cloudflare Pages', productUrl: 'https://pages.dev',
+      effort: 'easy', adapter: '@astrojs/cloudflare', adapterInstall: 'npx astro add cloudflare',
+      estimatedTime: '15 min',
+      steps: ['Run npx astro add cloudflare', 'Update astro.config.mjs', 'Add wrangler.toml', 'Build with astro build', 'Deploy with wrangler pages deploy'],
+      configChanges: [`name = "my-astro-site"\ncompatibility_date = "${today}"\npages_build_output_dir = "dist"`],
+      gotchas: ['SSR mode requires @astrojs/cloudflare adapter', 'Node APIs not available in Workers'], docsUrl: 'https://docs.astro.build/en/guides/integrations-guide/cloudflare/',
+    };
+  }
+  if (fwLower.includes('sveltekit')) {
+    return {
+      framework: 'SvelteKit', targetProduct: 'Cloudflare Pages', productUrl: 'https://pages.dev',
+      effort: 'easy', adapter: '@sveltejs/adapter-cloudflare', adapterInstall: 'npm install -D @sveltejs/adapter-cloudflare',
+      estimatedTime: '15 min',
+      steps: ['Install @sveltejs/adapter-cloudflare', 'Update svelte.config.js', 'Add wrangler.toml', 'Build and deploy with wrangler'],
+      configChanges: [`name = "my-sveltekit-app"\ncompatibility_date = "${today}"\npages_build_output_dir = ".svelte-kit/cloudflare"`],
+      gotchas: ['Replace @sveltejs/adapter-auto if present', 'Check for Node-only dependencies'], docsUrl: 'https://kit.svelte.dev/docs/adapter-cloudflare',
+    };
+  }
+  if (fwLower.includes('remix')) {
+    return {
+      framework: 'Remix', targetProduct: 'Cloudflare Pages', productUrl: 'https://pages.dev',
+      effort: 'easy', adapter: '@remix-run/cloudflare', adapterInstall: 'npm install @remix-run/cloudflare',
+      estimatedTime: '20 min',
+      steps: ['Install @remix-run/cloudflare', 'Update remix.config.js', 'Add wrangler.toml', 'Build and deploy'],
+      configChanges: [`name = "my-remix-app"\ncompatibility_date = "${today}"`],
+      gotchas: ['Some Node APIs need polyfills', 'Cloudflare KV for session storage'], docsUrl: 'https://remix.run/docs/en/main/guides/cloudflare',
+    };
+  }
+  if (fwLower.includes('nuxt')) {
+    return {
+      framework: 'Nuxt', targetProduct: 'Cloudflare Pages', productUrl: 'https://pages.dev',
+      effort: 'easy', adapter: 'nitro-cloudflare-dev', adapterInstall: 'npm install -D nitro-cloudflare-dev',
+      estimatedTime: '15 min',
+      steps: ['Install nitro-cloudflare-dev', 'Update nuxt.config.ts with nitro preset', 'Add wrangler.toml', 'Build with nuxt build', 'Deploy with wrangler'],
+      configChanges: [`name = "my-nuxt-app"\ncompatibility_date = "${today}"\npages_build_output_dir = ".output/public"`],
+      gotchas: ['Use cloudflare_pages nitro preset', 'Check for Node-only modules'], docsUrl: 'https://nitro.unjs.io/deploy/providers/cloudflare',
+    };
+  }
+
+  // Default JS guide
   return {
     framework: stack, targetProduct: 'Cloudflare Pages', productUrl: 'https://pages.dev',
     effort: 'easy', estimatedTime: '15 min',
     steps: ['Install Wrangler CLI', 'Run wrangler pages project create', 'Configure build command', 'Deploy'],
-    configChanges: ['Add wrangler.toml', 'Update build script'], gotchas: ['Check Node.js compatibility'],
+    configChanges: [`name = "my-app"\ncompatibility_date = "${today}"\n\n[build]\ncommand = "npm run build"`], gotchas: ['Check Node.js compatibility'],
     docsUrl: 'https://developers.cloudflare.com/pages',
   };
 }
@@ -484,8 +1103,9 @@ async function handleConfigGen(request: Request): Promise<Response> {
   let config = '';
   let filename = '';
   const today = new Date().toISOString().split('T')[0];
+  const fwLower = framework.toLowerCase();
 
-  switch (framework.toLowerCase()) {
+  switch (fwLower) {
     case 'next.js':
       filename = 'wrangler.jsonc';
       config = `{\n  "name": "my-next-app",\n  "compatibility_date": "${today}",\n  "pages_build_output_dir": ".vercel/output/static"\n}`;
@@ -494,12 +1114,238 @@ async function handleConfigGen(request: Request): Promise<Response> {
       filename = 'wrangler.jsonc';
       config = `{\n  "name": "my-astro-site",\n  "compatibility_date": "${today}",\n  "pages_build_output_dir": "dist"\n}`;
       break;
+    case 'sveltekit':
+      filename = 'wrangler.jsonc';
+      config = `{\n  "name": "my-sveltekit-app",\n  "compatibility_date": "${today}",\n  "pages_build_output_dir": ".svelte-kit/cloudflare"\n}`;
+      break;
+    case 'remix':
+      filename = 'wrangler.jsonc';
+      config = `{\n  "name": "my-remix-app",\n  "compatibility_date": "${today}",\n  "pages_build_output_dir": "public"\n}`;
+      break;
+    case 'nuxt':
+      filename = 'wrangler.jsonc';
+      config = `{\n  "name": "my-nuxt-app",\n  "compatibility_date": "${today}",\n  "pages_build_output_dir": ".output/public"\n}`;
+      break;
+    case 'django':
+      filename = 'Dockerfile';
+      config = `FROM python:3.11-slim\n\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\n\nCOPY . .\nEXPOSE 8000\n\nCMD ["gunicorn", "--bind", "0.0.0.0:8000", "myproject.wsgi:application"]`;
+      break;
+    case 'fastapi':
+      filename = 'Dockerfile';
+      config = `FROM python:3.11-slim\n\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\n\nCOPY . .\nEXPOSE 8000\n\nCMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]`;
+      break;
+    case 'flask':
+      filename = 'Dockerfile';
+      config = `FROM python:3.11-slim\n\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\n\nCOPY . .\nEXPOSE 5000\n\nCMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]`;
+      break;
+    case 'gin':
+    case 'echo':
+    case 'fiber':
+    case 'chi':
+    case 'go':
+      filename = 'Dockerfile';
+      config = `# Build stage\nFROM golang:1.22-alpine AS builder\nWORKDIR /app\nCOPY go.mod go.sum ./\nRUN go mod download\nCOPY . .\nRUN CGO_ENABLED=0 GOOS=linux go build -o main .\n\n# Runtime stage\nFROM alpine:latest\nRUN apk --no-cache add ca-certificates\nWORKDIR /root/\nCOPY --from=builder /app/main .\nEXPOSE 8080\nCMD ["./main"]`;
+      break;
+    case 'actix web':
+    case 'axum':
+    case 'rocket':
+    case 'rust':
+      filename = 'Dockerfile';
+      config = `# Build stage\nFROM rust:1.75-slim AS builder\nWORKDIR /app\nCOPY Cargo.toml Cargo.lock ./\nCOPY src ./src\nRUN cargo build --release\n\n# Runtime stage\nFROM debian:bookworm-slim\nWORKDIR /app\nCOPY --from=builder /app/target/release/myapp ./\nEXPOSE 8080\nCMD ["./myapp"]`;
+      break;
+    case 'spring boot':
+    case 'java':
+      filename = 'Dockerfile';
+      config = `FROM eclipse-temurin:21-jre-alpine\n\nWORKDIR /app\nCOPY target/*.jar app.jar\n\nEXPOSE 8080\nENTRYPOINT ["java", "-jar", "app.jar"]`;
+      break;
     default:
       filename = 'wrangler.toml';
       config = `name = "my-app"\ncompatibility_date = "${today}"\n\n[build]\ncommand = "npm run build"`;
   }
 
   return jsonResponse({ filename, config });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-Fix Engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface AutoFix {
+  id: string;
+  title: string;
+  description: string;
+  file: string;
+  current?: string;
+  replacement: string;
+  action: 'create' | 'replace' | 'append';
+  effort: 'easy' | 'medium' | 'hard';
+  category: 'config' | 'docker' | 'ci' | 'deps' | 'code';
+}
+
+async function handleAutoFix(request: Request, env: Env): Promise<Response> {
+  let body: { repoUrl?: string; finding?: string };
+  try { body = await request.json(); } catch {
+    return jsonResponse({ error: 'Invalid JSON' }, 400);
+  }
+
+  const { repoUrl, finding } = body;
+  if (!repoUrl) return jsonResponse({ error: 'repoUrl required' }, 400);
+
+  const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!match) return jsonResponse({ error: 'Invalid GitHub URL' }, 400);
+  const [, owner, rawRepo] = match;
+  const repoName = rawRepo.replace(/\.git$/, '');
+
+  // Run analysis to get full context
+  const result = await analyzeRepo(owner, repoName, env);
+  const fixes: AutoFix[] = [];
+  const fd = result.deepAnalysis.frameworkDetection;
+  const today = new Date().toISOString().split('T')[0];
+
+  // Fix 1: Missing wrangler config for JS projects
+  if (fd?.language === 'javascript' && !result.files.some(f => f.startsWith('wrangler'))) {
+    const fw = fd.framework;
+    let wranglerConfig = '';
+    let buildDir = 'dist';
+    if (fw === 'Next.js') buildDir = '.vercel/output/static';
+    else if (fw === 'Astro') buildDir = 'dist';
+    else if (fw === 'SvelteKit') buildDir = '.svelte-kit/cloudflare';
+    else if (fw === 'Nuxt') buildDir = '.output/public';
+    else if (fw === 'Remix') buildDir = 'public';
+
+    wranglerConfig = `name = "${repoName}"\ncompatibility_date = "${today}"\npages_build_output_dir = "${buildDir}"`;
+
+    fixes.push({
+      id: 'add-wrangler-config',
+      title: 'Add wrangler.toml for Cloudflare deployment',
+      description: `Create wrangler.toml with ${fw}-specific build output directory`,
+      file: 'wrangler.toml',
+      replacement: wranglerConfig,
+      action: 'create',
+      effort: 'easy',
+      category: 'config',
+    });
+  }
+
+  // Fix 2: Missing Dockerfile for non-JS projects
+  if ((fd?.language === 'python' || fd?.language === 'go' || fd?.language === 'rust' || fd?.language === 'java') && !result.deepAnalysis.dockerfile?.detected) {
+    const lang = fd.language;
+    const fw = fd.framework;
+    let dockerfile = '';
+
+    if (lang === 'python') {
+      const entry = fw === 'FastAPI' ? 'uvicorn main:app --host 0.0.0.0 --port 8000' : fw === 'Flask' ? 'gunicorn --bind 0.0.0.0:5000 app:app' : 'python app.py';
+      dockerfile = `FROM python:3.11-slim\n\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\n\nCOPY . .\nEXPOSE 8000\n\nCMD ["${entry.split(' ').join('", "')}"]`;
+    } else if (lang === 'go') {
+      dockerfile = `FROM golang:1.22-alpine AS builder\nWORKDIR /app\nCOPY go.mod go.sum ./\nRUN go mod download\nCOPY . .\nRUN CGO_ENABLED=0 GOOS=linux go build -o main .\n\nFROM alpine:latest\nRUN apk --no-cache add ca-certificates\nWORKDIR /root/\nCOPY --from=builder /app/main .\nEXPOSE 8080\nCMD ["./main"]`;
+    } else if (lang === 'rust') {
+      dockerfile = `FROM rust:1.75-slim AS builder\nWORKDIR /app\nCOPY Cargo.toml Cargo.lock ./\nCOPY src ./src\nRUN cargo build --release\n\nFROM debian:bookworm-slim\nWORKDIR /app\nCOPY --from=builder /app/target/release/${repoName} ./\nEXPOSE 8080\nCMD ["./${repoName}"]`;
+    } else if (lang === 'java') {
+      dockerfile = `FROM eclipse-temurin:21-jre-alpine\n\nWORKDIR /app\nCOPY target/*.jar app.jar\n\nEXPOSE 8080\nENTRYPOINT ["java", "-jar", "app.jar"]`;
+    }
+
+    fixes.push({
+      id: 'add-dockerfile',
+      title: `Add Dockerfile for ${fw || lang}`,
+      description: `Containerize your ${fw || lang} app for Cloudflare Containers`,
+      file: 'Dockerfile',
+      replacement: dockerfile,
+      action: 'create',
+      effort: 'easy',
+      category: 'docker',
+    });
+  }
+
+  // Fix 3: Missing CI/CD for Cloudflare
+  if (!result.deepAnalysis.cicd?.hasCloudflareDeploy && !result.files.includes('.github')) {
+    const lang = fd?.language || 'javascript';
+    let workflow = '';
+
+    if (lang === 'javascript') {
+      workflow = `name: Deploy to Cloudflare Pages\n\non:\n  push:\n    branches: [main]\n\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-node@v4\n        with:\n          node-version: '20'\n      - run: npm ci\n      - run: npm run build\n      - name: Deploy to Cloudflare\n        uses: cloudflare/pages-action@v1\n        with:\n          apiToken: \${{ secrets.CLOUDFLARE_API_TOKEN }}\n          accountId: \${{ secrets.CLOUDFLARE_ACCOUNT_ID }}\n          projectName: ${repoName}\n          directory: dist`;
+    } else {
+      workflow = `name: Deploy to Cloudflare Containers\n\non:\n  push:\n    branches: [main]\n\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: Build container\n        run: docker build -t ${repoName} .\n      - name: Deploy to Cloudflare\n        run: echo "Add your Cloudflare container deploy command here"`;
+    }
+
+    fixes.push({
+      id: 'add-ci-cd',
+      title: 'Add GitHub Actions workflow for Cloudflare deploy',
+      description: `Automated deployment on every push to main`,
+      file: '.github/workflows/deploy.yml',
+      replacement: workflow,
+      action: 'create',
+      effort: 'medium',
+      category: 'ci',
+    });
+  }
+
+  // Fix 4: Missing Cloudflare adapter for JS frameworks
+  if (fd?.language === 'javascript' && fd.framework && !fd.adapter) {
+    const fw = fd.framework;
+    let adapterName = '';
+    let adapterInstall = '';
+    let configUpdate = '';
+
+    if (fw === 'Next.js') {
+      adapterName = '@cloudflare/next-on-pages';
+      adapterInstall = 'npm install @cloudflare/next-on-pages';
+      configUpdate = '// next.config.js\nmodule.exports = {\n  output: "export",\n};';
+    } else if (fw === 'Astro') {
+      adapterName = '@astrojs/cloudflare';
+      adapterInstall = 'npx astro add cloudflare';
+      configUpdate = '// astro.config.mjs\nimport cloudflare from "@astrojs/cloudflare";\nexport default defineConfig({\n  output: "server",\n  adapter: cloudflare(),\n});';
+    } else if (fw === 'SvelteKit') {
+      adapterName = '@sveltejs/adapter-cloudflare';
+      adapterInstall = 'npm install -D @sveltejs/adapter-cloudflare';
+      configUpdate = '// svelte.config.js\nimport adapter from "@sveltejs/adapter-cloudflare";\nexport default {\n  kit: { adapter: adapter() }\n};';
+    } else if (fw === 'Remix') {
+      adapterName = '@remix-run/cloudflare';
+      adapterInstall = 'npm install @remix-run/cloudflare';
+    }
+
+    if (adapterName) {
+      fixes.push({
+        id: 'add-cloudflare-adapter',
+        title: `Install ${adapterName} for ${fw}`,
+        description: `Add Cloudflare adapter to make ${fw} deployable on Pages/Workers`,
+        file: 'package.json',
+        replacement: `${adapterInstall}\n${configUpdate}`,
+        action: 'append',
+        effort: 'medium',
+        category: 'deps',
+      });
+    }
+  }
+
+  // Fix 5: Single-stage Dockerfile → multi-stage
+  if (result.deepAnalysis.dockerfile?.detected && !result.deepAnalysis.dockerfile.multiStage) {
+    fixes.push({
+      id: 'optimize-dockerfile',
+      title: 'Convert Dockerfile to multi-stage build',
+      description: 'Multi-stage builds reduce image size and attack surface',
+      file: 'Dockerfile',
+      replacement: '# See migration guide for multi-stage Dockerfile template',
+      action: 'replace',
+      effort: 'medium',
+      category: 'docker',
+    });
+  }
+
+  // Fix 6: Missing .dockerignore
+  if (result.deepAnalysis.dockerfile?.detected && !result.files.includes('.dockerignore')) {
+    fixes.push({
+      id: 'add-dockerignore',
+      title: 'Add .dockerignore to reduce image size',
+      description: 'Exclude node_modules, .git, and build artifacts from Docker context',
+      file: '.dockerignore',
+      replacement: 'node_modules\n.git\n.env\n*.log\ndist\nbuild\n.DS_Store',
+      action: 'create',
+      effort: 'easy',
+      category: 'docker',
+    });
+  }
+
+  return jsonResponse({ repo: result.repo, fixes });
 }
 
 async function handleShareGen(request: Request): Promise<Response> {
