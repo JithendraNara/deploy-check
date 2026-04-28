@@ -102,74 +102,155 @@ async function fetchDirContents(owner: string, repo: string, path: string, env: 
   } catch { return []; }
 }
 
+function pickOne<T>(arr: T[]): T { return arr[Math.floor(Math.random() * arr.length)]; }
+
 function generateRicComments(result: AnalyzeResult): RicComment[] {
   const comments: RicComment[] = [];
   const s = result.score;
   const v = result.verdict;
   const d = result.deepAnalysis;
+  const repo = result.repoName;
+  const files = result.files.length;
 
+  // Score-based reactions (3+ variants each, injected with real data)
   if (s >= 90) {
-    comments.push({ text: "Oh damn. This thing is basically begging to be deployed.", tone: 'impressed' });
+    comments.push(pickOne([
+      { text: `Oh damn. ${repo} is basically begging to be deployed.`, tone: 'impressed' },
+      { text: `${repo}? Chef's kiss. This thing is production-ready.`, tone: 'impressed' },
+      { text: `Score of ${s}? ${repo} is showing off now.`, tone: 'impressed' },
+    ]));
   } else if (s >= 70) {
-    comments.push({ text: "Not bad. I have seen worse. I have seen WAY worse.", tone: 'encouraging' });
+    comments.push(pickOne([
+      { text: `Not bad. I've seen worse. I've seen WAY worse.`, tone: 'encouraging' },
+      { text: `${repo} is a solid B+. Nothing embarrassing here.`, tone: 'encouraging' },
+      { text: `${s}/100? Respectable. Could be worse. Could be PHP.`, tone: 'encouraging' },
+    ]));
   } else if (s >= 40) {
-    comments.push({ text: "Okay, so... we are gonna need to talk about some things.", tone: 'concerned' });
+    comments.push(pickOne([
+      { text: `Okay, so... we're gonna need to talk about some things.`, tone: 'concerned' },
+      { text: `${repo} is giving "it works on my machine" energy.`, tone: 'concerned' },
+      { text: `Look, it's not terrible. It's just... not great.`, tone: 'concerned' },
+    ]));
   } else {
-    comments.push({ text: "Buddy. Pal. Friend. What are we even doing here?", tone: 'savage' });
+    comments.push(pickOne([
+      { text: `Buddy. Pal. Friend. What are we even doing here?`, tone: 'savage' },
+      { text: `${repo} scored ${s}. Out of 100. Let that sink in.`, tone: 'savage' },
+      { text: `I've seen abandoned repos with better structure.`, tone: 'savage' },
+    ]));
   }
 
+  // Dockerfile observations (specific, data-driven)
   if (d.dockerfile?.detected) {
-    if (d.dockerfile.multiStage) {
-      comments.push({ text: "Multi-stage Dockerfile? Someone actually read the docs. Respect.", tone: 'impressed' });
+    const df = d.dockerfile;
+    if (df.multiStage) {
+      comments.push({ text: `Multi-stage Dockerfile${df.nodeVersion ? ` (Node ${df.nodeVersion})` : ''}? Someone actually read the docs. Respect.`, tone: 'impressed' });
     } else {
-      comments.push({ text: "Single-stage Dockerfile. Cute. Like deploying with a parachute made of tissue paper.", tone: 'savage' });
+      comments.push({ text: `Single-stage Dockerfile. Cute. Like deploying with a parachute made of tissue paper.`, tone: 'savage' });
     }
+    if (df.exposesPort && !df.multiStage) {
+      comments.push({ text: `Exposes a port but no multi-stage build. Bold.`, tone: 'concerned' });
+    }
+  } else if (files > 0) {
+    comments.push({ text: `No Dockerfile detected. ${s >= 70 ? 'Fine for Pages/Workers.' : 'Might want one for containers.'}`, tone: 'neutral' });
   }
 
+  // CI/CD observations (platform-specific)
   if (d.cicd?.detected) {
-    if (d.cicd.hasCloudflareDeploy) {
-      comments.push({ text: "Already deploying to Cloudflare? You are just showing off now.", tone: 'impressed' });
-    } else {
-      comments.push({ text: `Got ${d.cicd.platforms.join(', ')} but no Cloudflare? Branching out, I see.`, tone: 'neutral' });
+    const cicd = d.cicd;
+    if (cicd.hasCloudflareDeploy) {
+      comments.push({ text: `Already deploying to Cloudflare? You're just showing off now.`, tone: 'impressed' });
+    } else if (cicd.platforms.length > 0) {
+      const platforms = cicd.platforms.join(', ');
+      comments.push({ text: `Got ${platforms} CI/CD but no Cloudflare? Branching out, I see.`, tone: 'neutral' });
+      if (cicd.workflows.length > 2) {
+        comments.push({ text: `${cicd.workflows.length} workflow files. Someone likes automation.`, tone: 'encouraging' });
+      }
     }
   }
 
+  // Migration signals (specific platforms)
   if (d.migrationSignals?.detected) {
     const platforms = d.migrationSignals.platforms;
     comments.push({ text: `Currently squatting on ${platforms.join(' + ')}. Time to upgrade.`, tone: 'savage' });
   }
 
+  // Dependency/framework observations (specific names)
   if (d.dependencies?.serverFrameworks.length) {
     const fw = d.dependencies.serverFrameworks[0];
     comments.push({ text: `${fw}? In ${new Date().getFullYear()}? Bold strategy. Let's see if it pays off.`, tone: 'concerned' });
   }
+  if (d.dependencies?.total > 50) {
+    comments.push({ text: `${d.dependencies.total} dependencies. Hope you trust all of them.`, tone: 'concerned' });
+  } else if (d.dependencies?.total > 0 && d.dependencies.total < 10) {
+    comments.push({ text: `Only ${d.dependencies.total} dependencies. Minimalist. I respect it.`, tone: 'impressed' });
+  }
+  if (d.dependencies?.cloudflareRelated.length) {
+    const cfDeps = d.dependencies.cloudflareRelated.slice(0, 3).join(', ');
+    comments.push({ text: `Spotted ${cfDeps}. Someone's been reading the Cloudflare docs.`, tone: 'impressed' });
+  }
 
+  // Workers compatibility (score-driven, specific issues)
   if (d.workersCompatibility) {
     const wc = d.workersCompatibility;
     if (wc.score >= 80) {
-      comments.push({ text: "Workers compatibility is solid. This'll run smoother than my pickup lines.", tone: 'impressed' });
+      comments.push({ text: `Workers compatibility is solid. This'll run smoother than my pickup lines.`, tone: 'impressed' });
     } else if (wc.score >= 50) {
-      comments.push({ text: "Some Node.js APIs in there. Workers will complain like my mom when I don't call.", tone: 'concerned' });
+      comments.push({ text: `Some Node.js APIs in there. Workers will complain like my mom when I don't call.`, tone: 'concerned' });
     } else if (wc.issues.length > 0) {
-      comments.push({ text: "Yeah no, half these deps are gonna throw a tantrum in Workers.", tone: 'savage' });
+      const issue = wc.issues[0];
+      comments.push({ text: `Yeah no, ${issue} is gonna throw a tantrum in Workers.`, tone: 'savage' });
     }
   }
 
+  // Framework detection (specific config file + render mode)
+  if (d.frameworkDetection?.framework) {
+    const fd = d.frameworkDetection;
+    if (fd.configFile) {
+      comments.push({ text: `Found ${fd.configFile}. ${fd.renderMode ? `${fd.renderMode.toUpperCase()} mode detected.` : ''}`, tone: 'neutral' });
+    }
+    if (fd.adapter) {
+      comments.push({ text: `${fd.adapter} adapter installed. You're halfway to Cloudflare already.`, tone: 'encouraging' });
+    }
+  }
+
+  // Migration guide (specific effort + framework)
   if (result.migrationGuide) {
     const mg = result.migrationGuide;
     if (mg.effort === 'easy') {
       comments.push({ text: `${mg.framework} to Cloudflare? Easy money. Like stealing candy from a baby. A very technical baby.`, tone: 'encouraging' });
     } else if (mg.effort === 'hard') {
       comments.push({ text: `${mg.framework}? Oh honey. Buckle up. This is gonna hurt... but only a little.`, tone: 'concerned' });
+    } else {
+      comments.push({ text: `${mg.framework} migration? Doable. Grab some coffee.`, tone: 'neutral' });
+    }
+    if (mg.estimatedTime) {
+      comments.push({ text: `Estimated migration time: ${mg.estimatedTime}. That's... optimistic.`, tone: 'neutral' });
     }
   }
 
+  // File structure observations
+  if (files === 0) {
+    comments.push({ text: `Couldn't read the file tree. GitHub API said "nah."`, tone: 'savage' });
+  } else if (files < 5) {
+    comments.push({ text: `Only ${files} files? This is either elegant or abandoned.`, tone: 'concerned' });
+  }
+
+  // Final verdict reaction (varied by actual verdict)
   if (v === 'workers' || v === 'pages-static' || v === 'pages-spa') {
-    comments.push({ text: "Verdict? DEPLOY IT. Stop reading and push that button.", tone: 'impressed' });
+    comments.push(pickOne([
+      { text: `Verdict? DEPLOY IT. Stop reading and push that button.`, tone: 'impressed' },
+      { text: `What are you waiting for? Ship it.`, tone: 'impressed' },
+      { text: `${result.verdictLabel} is the move here. Obvious choice.`, tone: 'impressed' },
+    ]));
   } else if (v === 'containers') {
-    comments.push({ text: "Could work on Containers... but honestly? Just rewrite it. You'll thank me later.", tone: 'neutral' });
+    comments.push({ text: `Could work on Containers... but honestly? Just rewrite it. You'll thank me later.`, tone: 'neutral' });
   } else if (v === 'not-compatible') {
-    comments.push({ text: "Look, I'm not saying give up. But maybe... consider a different repo?", tone: 'savage' });
+    comments.push(pickOne([
+      { text: `Look, I'm not saying give up. But maybe... consider a different repo?`, tone: 'savage' },
+      { text: `This ain't it, chief.`, tone: 'savage' },
+    ]));
+  } else if (v === 'uncertain') {
+    comments.push({ text: `I honestly don't know what this is. Good luck.`, tone: 'concerned' });
   }
 
   return comments;
@@ -1491,7 +1572,7 @@ const HTML = `<!DOCTYPE html>
       
       html += '<div class="action-bar">';
       html += '<a class="action-btn" href="' + mg.docsUrl + '" target="_blank">Read Docs</a>';
-      html += '<button class="action-btn" onclick="generateConfig(\'' + mg.framework + '\')">Generate Config</button>';
+      html += '<button class="action-btn" data-framework="' + mg.framework + '" onclick="generateConfig(this.dataset.framework)">Generate Config</button>';
       html += '</div>';
       
       return html;
@@ -1517,9 +1598,10 @@ const HTML = `<!DOCTYPE html>
         
         const modal = document.createElement('div');
         modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
-        modal.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:30px;max-width:600px;width:100%;max-height:80vh;overflow:auto;"><h3 style="margin-bottom:16px;font-size:1.2rem;">' + data.filename + '</h3><div class="code-block" style="margin:0;"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre style="margin:0;white-space:pre-wrap;">' + data.config + '</pre></div><button onclick="this.closest(\'.modal\')?.remove()" style="margin-top:16px;padding:10px 20px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:8px;cursor:pointer;">Close</button></div>';
+        modal.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:30px;max-width:600px;width:100%;max-height:80vh;overflow:auto;"><h3 style="margin-bottom:16px;font-size:1.2rem;">' + data.filename + '</h3><div class="code-block" style="margin:0;"><button class="copy-btn" onclick="copyCode(this)">Copy</button><pre style="margin:0;white-space:pre-wrap;">' + data.config + '</pre></div><button class="cfg-close-btn" style="margin-top:16px;padding:10px 20px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:8px;cursor:pointer;">Close</button></div>';
         modal.classList.add('modal');
         document.body.appendChild(modal);
+        modal.querySelector('.cfg-close-btn').addEventListener('click', function() { modal.remove(); });
         modal.addEventListener('click', function(e) { if (e.target === modal) modal.remove(); });
       } catch (err) {
         alert('Error: ' + err.message);
