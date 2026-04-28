@@ -20,22 +20,47 @@ GitHub API → Deep Analyzer → Score Engine → Verdict → Ric Comments → F
 | `/api/analyze` | POST | Analyzes a repo URL. Returns score, verdict, deep analysis, migration guide, and commentary |
 | `/api/config` | POST | Generates framework-specific `wrangler.toml` / `wrangler.json` configs |
 | `/api/share` | POST | Renders an SVG share card with repo name, score, and verdict |
+| `/api/autofix` | POST | Generates actionable auto-fixes (Dockerfiles, configs, CI workflows) for detected issues |
 
 ### Analysis Pipeline
 
 1. **File tree scan** — Lists root files via GitHub API to identify stack signals
-2. **Content fetch** — Pulls key files (`package.json`, `Dockerfile`, CI configs, framework configs)
-3. **Deep analysis** —
-   - **Dockerfile**: multi-stage detection, base image, exposed ports, Node version
-   - **CI/CD**: platform detection (GitHub Actions, Vercel, Netlify, etc.), Cloudflare deploy check
+2. **Content fetch** — Pulls key files (`package.json`, `Dockerfile`, CI configs, framework configs, `go.mod`, `Cargo.toml`, `requirements.txt`)
+3. **Framework detection** — Identifies the framework across 5 languages:
+   - **JavaScript**: Next.js, Astro, SvelteKit, Remix, Nuxt, Angular, Vue, Hono, React
+   - **Python**: Django, Flask, FastAPI, Tornado, Bottle, Quart
+   - **Go**: Gin, Echo, Fiber, Chi, Gorilla Mux
+   - **Rust**: Actix Web, Axum, Rocket, Tide, Warp, WASM Workers
+   - **Java**: Spring Boot, Quarkus, Micronaut
+4. **Deep analysis** —
+   - **Dockerfile**: multi-stage detection, base image, exposed ports, Node version, language-specific base images
+   - **CI/CD**: platform detection (GitHub Actions, Vercel, Netlify, etc.), Cloudflare deploy check, workflow enumeration
    - **Dependencies**: total count, server frameworks, build tools, Cloudflare-related packages
-   - **Framework**: auto-detects Next.js, SvelteKit, Nuxt, Astro, Remix, etc. + render mode
+   - **Framework**: config file detection, render mode (SSR/SPA/static/ISR), adapter detection
    - **Workers compatibility**: Node.js API usage scoring, known incompatible dependency scan
-   - **Migration signals**: detects current hosting platforms (Vercel, Netlify, Railway, etc.)
-4. **Scoring** — weighted rubric across all dimensions (0–100)
-5. **Verdict** — maps score + stack to Cloudflare product recommendation
-6. **Migration guide** — generates framework-specific migration steps with effort estimation
-7. **Ric commentary** — generates persona-driven, data-injected observations
+   - **Migration signals**: detects current hosting platforms (Vercel, Netlify, Railway, Fly.io, Render)
+5. **Scoring** — language-aware weighted rubric (0–100)
+   - JS with Cloudflare adapter → 90+ (Pages/Workers)
+   - JS without adapter → checks Workers compatibility score
+   - Python/Go/Rust/Java → Containers (Dockerfile bonuses)
+   - WASM Rust → Workers
+6. **Verdict** — maps score + stack to Cloudflare product recommendation
+7. **Migration guide** — generates language/framework-specific migration steps with effort estimation
+8. **Ric commentary** — generates persona-driven, data-injected observations
+9. **Auto-fix engine** — generates specific code changes to fix detected issues
+
+---
+
+## Framework Detection
+
+| Language | Frameworks | Cloudflare Path |
+|----------|-----------|-----------------|
+| **JavaScript** | Next.js, Astro, SvelteKit, Remix, Nuxt, Angular, Vue, Hono, React | Pages / Workers |
+| **Python** | Django, Flask, FastAPI, Tornado, Bottle, Quart | Containers |
+| **Go** | Gin, Echo, Fiber, Chi, Gorilla Mux | Containers |
+| **Rust** | Actix Web, Axum, Rocket, Tide, Warp | Containers |
+| **Rust (WASM)** | wasm-bindgen workers | Workers |
+| **Java** | Spring Boot, Quarkus, Micronaut | Containers |
 
 ---
 
@@ -55,8 +80,8 @@ The "Ric" persona delivers commentary based on actual repo findings — not gene
 | Category | Triggers | Data Injected |
 |----------|----------|---------------|
 | **Score reaction** | Score tier (90+/70+/40+/sub-40) | Repo name, exact score |
-| **Dockerfile** | Dockerfile detected | Multi-stage flag, Node version, exposed port |
-| **CI/CD** | CI config detected | Platform names (GitHub Actions, Vercel...), workflow count |
+| **Dockerfile** | Dockerfile detected | Multi-stage flag, Node version, exposed port, base image language |
+| **CI/CD** | CI config detected | Platform names, workflow count, Cloudflare deploy status |
 | **Dependencies** | package.json analyzed | Total count, Cloudflare-related deps detected, server framework name |
 | **Workers compat** | Workers score computed | Exact compatibility score, first incompatible API/issue named |
 | **Framework** | Framework detected | Config filename, render mode (SSR/SPA/static/ISR), adapter name |
@@ -64,23 +89,32 @@ The "Ric" persona delivers commentary based on actual repo findings — not gene
 | **Structure** | File tree scanned | File count |
 | **Verdict** | Final verdict assigned | Verdict label |
 
-### Example Variation
+---
 
-Two repos scoring 75 will both hit the 70–89 tier, but their comments diverge based on actual findings:
+## Auto-Fix Engine
 
-- **Repo A** (Next.js, 45 deps, no Dockerfile, GitHub Actions):  
-  *"tollywood-chronicles is a solid B+. Nothing embarrassing here."*  
-  *"No Dockerfile detected. Fine for Pages/Workers."*  
-  *"Got GitHub Actions CI/CD but no Cloudflare? Branching out, I see."*  
-  *"45 dependencies. Hope you trust all of them."*  
-  *"Next.js to Cloudflare? Easy money..."*
+`POST /api/autofix` generates actionable fixes for detected issues. Each fix includes:
 
-- **Repo B** (Astro, 8 deps, multi-stage Dockerfile, no CI):  
-  *"cricboxd scored 75. Respectable. Could be worse. Could be PHP."*  
-  *"Multi-stage Dockerfile (Node 20)? Someone actually read the docs. Respect."*  
-  *"Only 8 dependencies. Minimalist. I respect it."*  
-  *"Found astro.config.mjs. STATIC mode detected."*  
-  *"Astro to Cloudflare? Easy money..."*
+- **id**: unique identifier for the fix
+- **title**: human-readable fix name
+- **description**: what the fix does and why
+- **file**: target file path
+- **current**: existing code to replace (for `replace` actions)
+- **replacement**: the new code/config to apply
+- **action**: `create` | `replace` | `append`
+- **effort**: `easy` | `medium` | `hard`
+- **category**: `config` | `docker` | `ci` | `deps` | `code`
+
+### Generated Fixes
+
+| Fix | Trigger | Output |
+|-----|---------|--------|
+| **Add wrangler.toml** | JS project without wrangler config | Framework-specific `wrangler.toml` with correct `pages_build_output_dir` |
+| **Add Dockerfile** | Python/Go/Rust/Java without Dockerfile | Language-specific Dockerfile (multi-stage for Go/Rust) |
+| **Add CI/CD workflow** | No `.github/workflows` | GitHub Actions workflow for Pages or Containers |
+| **Add Cloudflare adapter** | JS framework without adapter | Install command + config update for Next.js, Astro, SvelteKit, Remix |
+| **Optimize Dockerfile** | Single-stage Dockerfile | Multi-stage conversion suggestion |
+| **Add .dockerignore** | Dockerfile without `.dockerignore` | Standard `.dockerignore` for smaller builds |
 
 ---
 
